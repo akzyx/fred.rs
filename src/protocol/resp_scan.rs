@@ -4,7 +4,8 @@
 //! and throw the work away. Behind a transport that yields small reads (TLS hands over one record
 //! per read) that makes a large reply cost O(n²). This scanner remembers how far it got, so each
 //! decode attempt only looks at the new bytes, and the full decoder runs once per complete frame.
-//! It understands RESP2 and RESP3, and defers to the decoder on anything else.
+//! It understands RESP2 and RESP3, and defers to the decoder on anything else. It only reads the
+//! buffer and never copies or keeps any of it, so frames are still built by the zero-copy decoder.
 
 /// Outcome of advancing the scan over the buffered bytes.
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +17,10 @@ pub enum Scan {
   /// Not a frame the scanner understands; let the full decoder decide.
   Unknown,
 }
+
+/// Stack capacity kept between frames. `Vec::clear` keeps the allocation, so without a cap one deeply
+/// nested reply would keep its high-water mark allocated for the life of the connection.
+const RETAINED_DEPTH: usize = 64;
 
 #[derive(Debug, Default)]
 pub struct RespScan {
@@ -38,6 +43,7 @@ impl RespScan {
   pub fn reset(&mut self) {
     self.pos = 0;
     self.stack.clear();
+    self.stack.shrink_to(RETAINED_DEPTH);
   }
 
   /// Continues the scan over `buf`, which must be the same buffer (plus appended bytes) as on the
@@ -357,5 +363,16 @@ mod tests {
     assert_eq!(scan.advance(b"@1\r\n"), Scan::Unknown);
     scan.reset();
     assert_eq!(scan.advance(b">?\r\n"), Scan::Unknown);
+  }
+
+  #[test]
+  fn reset_releases_a_deep_stack() {
+    let mut buf = b"*1\r\n".repeat(10_000);
+    buf.extend_from_slice(b":1\r\n");
+    let mut scan = RespScan::default();
+    assert_eq!(scan.advance(&buf), Scan::Complete(buf.len()));
+    assert!(scan.stack.capacity() >= 10_000);
+    scan.reset();
+    assert!(scan.stack.capacity() <= RETAINED_DEPTH);
   }
 }
